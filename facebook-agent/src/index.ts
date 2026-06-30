@@ -62,11 +62,117 @@ async function login(page: any, email: string, password: string): Promise<boolea
   } catch (err) { logger.error("Login error: " + err); return false; }
 }
 
+// Collect post URLs by scrolling the page feed
+async function collectPostUrls(page: any, username: string, limit: number): Promise<{ url: string; date: string }[]> {
+  const found = new Map<string, string>(); // url -> date
+  let noNewCount = 0;
+
+  for (let scroll = 0; scroll < 25; scroll++) {
+    if (found.size >= limit) break;
+    if (noNewCount >= 4) break;
+    const prevSize = found.size;
+
+    // Method 1: Find all links that look like post permalinks
+    const postLinks = await page.evaluate(() => {
+      const results: { url: string; date: string }[] = [];
+      const seen = new Set<string>();
+
+      // Find links with post-identifying URL patterns
+      const allLinks = Array.from(document.querySelectorAll('a[href]'));
+      for (const a of allLinks) {
+        const href = (a as HTMLAnchorElement).href || "";
+        if (!href) continue;
+
+        const isPostLink = href.includes("/posts/") || href.includes("pfbid") ||
+          href.includes("story_fbid") || href.includes("/permalink/") ||
+          href.includes("/photo") || href.includes("/reel/") || href.includes("/videos/") ||
+          href.includes("fbid=");
+        if (!isPostLink) continue;
+
+        // Normalize URL — keep query params for fbid/pfbid/story_fbid URLs
+        let cleanUrl = href;
+        if (href.includes("fbid=") || href.includes("pfbid") || href.includes("story_fbid")) {
+          // Keep important query params, strip tracking params
+          try {
+            const u = new URL(href);
+            const keep = ["fbid", "set", "story_fbid", "id"];
+            const params = new URLSearchParams();
+            for (const k of keep) { const v = u.searchParams.get(k); if (v) params.set(k, v); }
+            cleanUrl = `${u.origin}${u.pathname}${params.toString() ? "?" + params.toString() : ""}`;
+          } catch { cleanUrl = href.split("&__cft__")[0]; }
+        } else {
+          cleanUrl = href.split("?")[0];
+        }
+
+        // Skip generic section links without actual content IDs
+        if (/\/(reel|videos|photos|posts|permalink)\/?$/.test(cleanUrl)) continue;
+        if (cleanUrl.endsWith("/photo/") || cleanUrl.endsWith("/photo")) continue;
+
+        if (seen.has(cleanUrl)) continue;
+        seen.add(cleanUrl);
+
+        // Try to find date near this link
+        let date = "";
+        const parent = a.closest('div') || a.parentElement;
+        if (parent) {
+          // Look for time element near this link (within the same post container)
+          let container: Element | null = a as Element;
+          for (let i = 0; i < 10; i++) {
+            container = container?.parentElement || null;
+            if (!container) break;
+            const timeEl = container.querySelector("time");
+            if (timeEl) {
+              date = timeEl.getAttribute("datetime") || "";
+              break;
+            }
+          }
+        }
+        // Also check if the link itself wraps a time element
+        const timeInLink = (a as Element).querySelector("time");
+        if (timeInLink && !date) date = timeInLink.getAttribute("datetime") || "";
+
+        results.push({ url: cleanUrl, date });
+      }
+
+      // Method 2: Find timestamp links (a > time pattern) — these always point to posts
+      const timeLinks = Array.from(document.querySelectorAll('a time'));
+      for (const timeEl of timeLinks) {
+        const anchor = timeEl.closest('a') as HTMLAnchorElement;
+        if (!anchor?.href) continue;
+        const href = anchor.href;
+        if (seen.has(href.split("?")[0])) continue;
+        seen.add(href.split("?")[0]);
+        const date = (timeEl as HTMLElement).getAttribute("datetime") || "";
+        results.push({ url: href.split("?")[0], date });
+      }
+
+      return results;
+    });
+
+    for (const { url, date } of postLinks) {
+      if (!found.has(url)) found.set(url, date);
+    }
+
+    if (found.size === prevSize) noNewCount++;
+    else noNewCount = 0;
+
+    logger.info(`  📜 Scroll ${scroll + 1}: found ${found.size} unique post URLs`);
+
+    // Scroll down
+    try {
+      await page.evaluate(() => window.scrollBy(0, 2000));
+      await page.waitForTimeout(3000);
+    } catch { break; }
+  }
+
+  return Array.from(found.entries()).map(([url, date]) => ({ url, date }));
+}
+
 async function scrapePage(page: any, username: string, progress: Record<string, string[]>): Promise<Post[]> {
   const pageUrl = `https://www.facebook.com/${username}`;
   logger.info(`\n🔵 Facebook page: ${username}`);
 
-  // Navigate to page
+  // Navigate to the page
   try {
     await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
   } catch {
@@ -74,145 +180,153 @@ async function scrapePage(page: any, username: string, progress: Record<string, 
   }
   await page.waitForTimeout(5000);
 
+  // Try clicking the "Posts" tab if visible
+  try {
+    const postsTab = page.locator('a[role="tab"]:has-text("Posts")').first();
+    if (await postsTab.isVisible({ timeout: 2000 })) {
+      await postsTab.click();
+      await page.waitForTimeout(3000);
+      logger.info(`  📑 "Posts" tab clicked`);
+    }
+  } catch { /* ignore */ }
+
+  logger.info(`  📍 URL: ${page.url()}`);
+
   // Get page name
   let pageName = username;
   try { const h1 = await page.locator("h1").first().textContent({ timeout: 3000 }); if (h1) pageName = h1.trim(); } catch { /* ignore */ }
 
   const folder = makeFolder(OUTPUT_DIR, "facebook", sanitize(pageName));
   const posts: Post[] = [];
-  const seenIds = new Set<string>();
   let limit = MAX_POSTS > 0 ? MAX_POSTS : 50;
-  let tooOldCount = 0;
 
-  // Scroll and process posts directly from feed
-  for (let scroll = 0; scroll < 20; scroll++) {
+  // Phase 1: Collect post URLs from the feed
+  logger.info(`  🔍 Post URLs সংগ্রহ করছি...`);
+  const postUrls = await collectPostUrls(page, username, limit);
+  logger.info(`  📋 ${postUrls.length}টি post URL পাওয়া গেছে`);
+
+  if (postUrls.length === 0) {
+    logger.info(`  ⚠️ কোনো post URL পাওয়া যায়নি`);
+    return posts;
+  }
+
+  // Phase 2: Visit each post individually and take screenshot
+  for (const { url: postUrl, date: feedDate } of postUrls) {
     if (posts.length >= limit) break;
-    if (tooOldCount >= 2) break;
 
-    // Find all article elements on page
-    const articleCount = await page.locator('div[role="article"]').count();
-
-    for (let idx = 0; idx < articleCount; idx++) {
-      if (posts.length >= limit) break;
-
-      try {
-        const article = page.locator('div[role="article"]').nth(idx);
-        if (!(await article.isVisible({ timeout: 1000 }))) continue;
-
-        // Generate unique ID from article content
-        const articleData = await article.evaluate((el: Element) => {
-          // Get all text for hashing
-          const text = el.textContent?.trim().slice(0, 200) || "";
-          // Find any post link
-          let postUrl = "";
-          const links = Array.from(el.querySelectorAll('a[href]'));
-          for (const a of links) {
-            const h = (a as HTMLAnchorElement).getAttribute("href") || "";
-            if (h.includes("/posts/") || h.includes("pfbid") || h.includes("story_fbid") ||
-                h.includes("permalink") || h.includes("/photo/") || h.includes("/reel/") || h.includes("/videos/")) {
-              postUrl = h; break;
-            }
-          }
-          // Fallback: timestamp link
-          if (!postUrl) {
-            const timeLink = el.querySelector('a[role="link"] time, a time');
-            if (timeLink) {
-              const parent = timeLink.closest('a') as HTMLAnchorElement;
-              if (parent?.href) postUrl = parent.href;
-            }
-          }
-          // Get date
-          let date = "";
-          const timeEl = el.querySelector("time");
-          if (timeEl) date = timeEl.getAttribute("datetime") || "";
-          const abbrEl = el.querySelector("abbr[data-utime]");
-          if (abbrEl) {
-            const ut = abbrEl.getAttribute("data-utime");
-            if (ut) date = new Date(parseInt(ut) * 1000).toISOString();
-          }
-          // Caption: largest text block
-          let caption = "";
-          const divs = Array.from(el.querySelectorAll('div[dir="auto"], span[dir="auto"]'));
-          for (const d of divs) {
-            const t = d.textContent?.trim() || "";
-            if (t.length > caption.length && t.length > 10) caption = t;
-          }
-          return { text: text.slice(0, 100), postUrl, date, caption };
-        });
-
-        // Generate post ID
-        let postId = "";
-        if (articleData.postUrl) {
-          const match = articleData.postUrl.match(/(?:posts\/|pfbid|story_fbid=|permalink\/|photo\/|reel\/|videos\/)([\w]+)/);
-          if (match) postId = match[1];
-        }
-        if (!postId) {
-          // Hash from text content
-          let hash = 0;
-          for (let i = 0; i < articleData.text.length; i++) { hash = ((hash << 5) - hash + articleData.text.charCodeAt(i)) | 0; }
-          postId = `post_${Math.abs(hash).toString(36)}`;
-        }
-
-        const fullId = `${username}_${postId}`;
-        if (seenIds.has(fullId)) continue;
-        seenIds.add(fullId);
-
-        // Skip non-post articles (page info, details etc)
-        if (!articleData.caption || articleData.caption.length < 10) continue;
-
-        if (isSaved(progress, username, fullId)) continue;
-
-        // Date check
-        const postDate = articleData.date ? toDateStr(articleData.date) : toDateStr(new Date().toISOString());
-        if (articleData.date && !isWithinDays(articleData.date, DAYS_BACK)) {
-          logger.info(`  ⏭️ Too old (${postDate}), stopping`);
-          tooOldCount++;
-          continue;
-        }
-
-        // Take screenshot of the article element directly
-        const ssFile = screenshotPath(folder, postDate, sanitize(fullId));
-        let ssOk = false;
-        try {
-          fs.mkdirSync(path.dirname(ssFile), { recursive: true });
-          await article.scrollIntoViewIfNeeded();
-          await page.waitForTimeout(1000);
-          await article.screenshot({ path: ssFile });
-          ssOk = fs.existsSync(ssFile) && fs.statSync(ssFile).size > 5000;
-        } catch { /* ignore */ }
-
-        if (!ssOk) {
-          logger.warn(`  ⚠️ Screenshot failed for ${fullId}`);
-          continue;
-        }
-
-        const postUrl = articleData.postUrl
-          ? (articleData.postUrl.startsWith("http") ? articleData.postUrl : `https://www.facebook.com${articleData.postUrl}`)
-          : pageUrl;
-
-        const post: Post = {
-          id: fullId,
-          platform: "facebook",
-          source: pageName,
-          caption: articleData.caption,
-          url: postUrl,
-          postDate,
-          createdTime: new Date().toISOString(),
-        };
-
-        saveCaptionFile(folder, post, sanitize(fullId));
-        markSaved(progress, username, fullId);
-        saveProgress(progress);
-        posts.push(post);
-        logger.info(`  ✓ [${posts.length}] ${articleData.caption.slice(0, 60)} | screenshot ✓`);
-      } catch { /* skip article */ }
+    // Extract post ID from URL
+    let postId = "";
+    // Try extracting fbid from query params first
+    try { const u = new URL(postUrl.startsWith("http") ? postUrl : `https://www.facebook.com${postUrl}`); const fbid = u.searchParams.get("fbid"); if (fbid) postId = fbid; } catch { /* ignore */ }
+    if (!postId) {
+      const idMatch = postUrl.match(/(?:posts\/|pfbid|story_fbid=|permalink\/|photo\/|reel\/|videos\/)([\w]+)/);
+      if (idMatch) postId = idMatch[1];
+    }
+    if (!postId) {
+      let hash = 0;
+      const str = postUrl;
+      for (let i = 0; i < str.length; i++) { hash = ((hash << 5) - hash + str.charCodeAt(i)) | 0; }
+      postId = `post_${Math.abs(hash).toString(36)}`;
     }
 
-    // Scroll down to load more
+    const fullId = `${username}_${postId}`;
+    if (isSaved(progress, username, fullId)) continue;
+
+    // Date check from feed (if available)
+    if (feedDate && !isWithinDays(feedDate, DAYS_BACK)) {
+      logger.info(`  ⏭️ Too old (${toDateStr(feedDate)}), skipping`);
+      continue;
+    }
+
+    // Navigate to the individual post
     try {
-      await page.evaluate(() => window.scrollBy(0, 2000));
-      await page.waitForTimeout(3000);
-    } catch { break; }
+      const fullUrl = postUrl.startsWith("http") ? postUrl : `https://www.facebook.com${postUrl}`;
+      await page.goto(fullUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
+      await page.waitForTimeout(4000);
+    } catch {
+      try {
+        const fullUrl = postUrl.startsWith("http") ? postUrl : `https://www.facebook.com${postUrl}`;
+        await page.goto(fullUrl, { waitUntil: "load", timeout: 20000 });
+        await page.waitForTimeout(4000);
+      } catch (err) {
+        logger.warn(`  ⚠️ Cannot open post: ${err}`);
+        continue;
+      }
+    }
+
+    // Extract date and caption from the individual post page
+    const postData = await page.evaluate(() => {
+      let date = "";
+      const timeEl = document.querySelector("time");
+      if (timeEl) date = timeEl.getAttribute("datetime") || "";
+      const abbrEl = document.querySelector("abbr[data-utime]");
+      if (abbrEl) {
+        const ut = abbrEl.getAttribute("data-utime");
+        if (ut) date = new Date(parseInt(ut) * 1000).toISOString();
+      }
+
+      let caption = "";
+      const divs = Array.from(document.querySelectorAll('div[dir="auto"], span[dir="auto"]'));
+      for (const d of divs) {
+        const t = d.textContent?.trim() || "";
+        if (t.length > caption.length && t.length > 10) caption = t;
+      }
+      return { date, caption };
+    });
+
+    const postDate = postData.date ? toDateStr(postData.date) : (feedDate ? toDateStr(feedDate) : toDateStr(new Date().toISOString()));
+
+    // Date check from individual post page
+    if (postData.date && !isWithinDays(postData.date, DAYS_BACK)) {
+      logger.info(`  ⏭️ Too old (${postDate}), skipping`);
+      continue;
+    }
+
+    // Take screenshot — try article element first, then full viewport
+    const ssFile = screenshotPath(folder, postDate, sanitize(fullId));
+    let ssOk = false;
+    try {
+      fs.mkdirSync(path.dirname(ssFile), { recursive: true });
+
+      // Try to find the post container on the individual post page
+      const articleEl = page.locator('div[role="article"]').first();
+      if (await articleEl.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await articleEl.scrollIntoViewIfNeeded();
+        await page.waitForTimeout(1000);
+        await articleEl.screenshot({ path: ssFile });
+      } else {
+        // Fallback: screenshot the main content area or full viewport
+        const mainEl = page.locator('div[role="main"]').first();
+        if (await mainEl.isVisible({ timeout: 2000 }).catch(() => false)) {
+          await mainEl.screenshot({ path: ssFile });
+        } else {
+          await page.screenshot({ path: ssFile, fullPage: false });
+        }
+      }
+      ssOk = fs.existsSync(ssFile) && fs.statSync(ssFile).size > 5000;
+    } catch (ssErr) { logger.warn(`  ⚠️ Screenshot error: ${ssErr}`); }
+
+    if (!ssOk) {
+      logger.warn(`  ⚠️ Screenshot failed for ${fullId}`);
+      continue;
+    }
+
+    const fullPostUrl = postUrl.startsWith("http") ? postUrl : `https://www.facebook.com${postUrl}`;
+    const post: Post = {
+      id: fullId,
+      platform: "facebook",
+      source: pageName,
+      caption: postData.caption || "(no caption)",
+      url: fullPostUrl,
+      postDate,
+      createdTime: new Date().toISOString(),
+    };
+
+    saveCaptionFile(folder, post, sanitize(fullId));
+    markSaved(progress, username, fullId);
+    saveProgress(progress);
+    posts.push(post);
+    logger.info(`  ✓ [${posts.length}] ${(postData.caption || postId).slice(0, 60)} | screenshot ✓`);
   }
 
   logger.info(`  ✅ ${pageName}: ${posts.length}টি post`);
