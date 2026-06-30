@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+.sessions/
+.*_session.json
+.progress.json
+logs/
+screenshots/
