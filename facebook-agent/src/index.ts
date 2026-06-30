@@ -5,8 +5,7 @@ import * as dotenv from "dotenv";
 import * as cron from "node-cron";
 import { chromium } from "playwright";
 import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved, isWithinDays } from "./helpers";
-import { takeScreenshot } from "./screenshot";
-import type { Post, Comment } from "./types";
+import type { Post } from "./types";
 
 dotenv.config();
 
@@ -28,52 +27,31 @@ async function login(page: any, email: string, password: string): Promise<boolea
     await page.goto("https://www.facebook.com/", { waitUntil: "domcontentloaded", timeout: 30000 });
     await page.waitForTimeout(3000);
 
-    // Cookie popup dismiss
-    for (const sel of [
-      '[data-cookiebanner="accept_button"]',
-      'button[data-testid="cookie-policy-manage-dialog-accept-button"]',
-      'button:has-text("Allow all cookies")',
-      'button:has-text("Accept all")',
-      'button:has-text("Accept")',
-    ]) {
-      try {
-        const b = page.locator(sel).first();
-        if (await b.isVisible({ timeout: 1000 })) { await b.click(); await page.waitForTimeout(1000); break; }
-      } catch { /* ignore */ }
+    for (const sel of ['[data-cookiebanner="accept_button"]', 'button:has-text("Allow all cookies")', 'button:has-text("Accept all")']) {
+      try { const b = page.locator(sel).first(); if (await b.isVisible({ timeout: 1000 })) { await b.click(); await page.waitForTimeout(1000); break; } } catch { /* ignore */ }
     }
 
-    // Email field
     let emailField = page.locator("#email").first();
-    if (!(await emailField.isVisible({ timeout: 2000 }).catch(() => false))) {
-      emailField = page.locator('input[name="email"]').first();
-    }
+    if (!(await emailField.isVisible({ timeout: 2000 }).catch(() => false))) emailField = page.locator('input[name="email"]').first();
     await emailField.waitFor({ state: "visible", timeout: 10000 });
     await emailField.fill(email);
     await page.waitForTimeout(500);
 
-    // Password field
     let passField = page.locator("#pass").first();
-    if (!(await passField.isVisible({ timeout: 2000 }).catch(() => false))) {
-      passField = page.locator('input[name="pass"], input[type="password"]').first();
-    }
+    if (!(await passField.isVisible({ timeout: 2000 }).catch(() => false))) passField = page.locator('input[name="pass"], input[type="password"]').first();
     await passField.waitFor({ state: "visible", timeout: 10000 });
     await passField.fill(password);
     await page.waitForTimeout(500);
 
-    // Login button
     let clicked = false;
-    for (const sel of ['button[name="login"]', 'button[type="submit"]', '[data-testid="royal_login_button"]', 'button:has-text("Log in")', 'button:has-text("Log In")']) {
+    for (const sel of ['button[name="login"]', 'button[type="submit"]', '[data-testid="royal_login_button"]', 'button:has-text("Log in")']) {
       try { const b = page.locator(sel).first(); if (await b.isVisible({ timeout: 1500 })) { await b.click(); clicked = true; break; } } catch { /* try next */ }
     }
-    if (!clicked) { await passField.press("Enter"); }
+    if (!clicked) await passField.press("Enter");
 
     await page.waitForTimeout(8000);
     const url = page.url();
-
-    const stillOnLogin = await page.locator("#email").first().isVisible({ timeout: 2000 }).catch(() => false) ||
-      await page.locator('input[name="email"]').first().isVisible({ timeout: 2000 }).catch(() => false);
-
-    if (!stillOnLogin && url.includes("facebook.com") && !url.includes("login")) { logger.info("✅ Login সফল!"); return true; }
+    if (url.includes("facebook.com") && !url.includes("login")) { logger.info("✅ Login সফল!"); return true; }
     if (url.includes("checkpoint") || url.includes("challenge")) {
       logger.warn("⚠️  2FA/Checkpoint — ৪৫ সেকেন্ড সময় দিচ্ছি...");
       await page.waitForTimeout(45000);
@@ -84,251 +62,161 @@ async function login(page: any, email: string, password: string): Promise<boolea
   } catch (err) { logger.error("Login error: " + err); return false; }
 }
 
-async function collectPostUrls(page: any, pageUrl: string, username: string, progress: Record<string, string[]>): Promise<{ id: string; url: string; postDate: string }[]> {
-  // Page already navigated by caller, no need to goto again
-  await page.waitForTimeout(2000);
+async function scrapePage(page: any, username: string, progress: Record<string, string[]>): Promise<Post[]> {
+  const pageUrl = `https://www.facebook.com/${username}`;
+  logger.info(`\n🔵 Facebook page: ${username}`);
 
-  const collected: { id: string; url: string; postDate: string }[] = [];
+  // Navigate to page
+  try {
+    await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+  } catch {
+    await page.goto(pageUrl, { waitUntil: "load", timeout: 30000 });
+  }
+  await page.waitForTimeout(5000);
+
+  // Get page name
+  let pageName = username;
+  try { const h1 = await page.locator("h1").first().textContent({ timeout: 3000 }); if (h1) pageName = h1.trim(); } catch { /* ignore */ }
+
+  const folder = makeFolder(OUTPUT_DIR, "facebook", sanitize(pageName));
+  const posts: Post[] = [];
   const seenIds = new Set<string>();
-  let lastHeight = 0;
-  let noNewCount = 0;
+  let limit = MAX_POSTS > 0 ? MAX_POSTS : 50;
+  let tooOldCount = 0;
 
-  const processedCount = progress[username] ? progress[username].length : 0;
-  const isFirstRun = processedCount < 10;
-  let limit = isFirstRun ? (10 - processedCount) : (MAX_POSTS > 0 ? MAX_POSTS : 99999);
-  if (MAX_POSTS > 0 && MAX_POSTS < limit) limit = MAX_POSTS;
+  // Scroll and process posts directly from feed
+  for (let scroll = 0; scroll < 20; scroll++) {
+    if (posts.length >= limit) break;
+    if (tooOldCount >= 2) break;
 
-  logger.info(`  🔍 Post URLs scan করছি: ${pageUrl}`);
+    // Find all article elements on page
+    const articleCount = await page.locator('div[role="article"]').count();
 
-  let shouldStop = false;
+    for (let idx = 0; idx < articleCount; idx++) {
+      if (posts.length >= limit) break;
 
-  while (true) {
-    const links = await page.locator('a[href*="/posts/"], a[href*="story_fbid="], a[href*="permalink/"]').all();
-
-    for (const link of links) {
-      if (collected.length >= limit) { shouldStop = true; break; }
       try {
-        const href = await link.getAttribute("href") ?? "";
-        if (!href || (!href.includes("/posts/") && !href.includes("story_fbid=") && !href.includes("permalink/"))) continue;
-        const fullUrl = href.startsWith("http") ? href : `https://www.facebook.com${href}`;
-        const match = href.match(/(?:posts\/|story_fbid=|permalink\/)([A-Za-z0-9_\-]+)/);
-        if (!match) continue;
-        const postId = `${username}_${match[1]}`;
+        const article = page.locator('div[role="article"]').nth(idx);
+        if (!(await article.isVisible({ timeout: 1000 }))) continue;
 
-        if (seenIds.has(postId)) continue;
-        seenIds.add(postId);
-
-        const saved = isSaved(progress, username, postId);
-        if (saved && !isFirstRun && seenIds.size > 1) {
-          logger.info(`    ℹ️ Already saved post: ${postId}. Stopping.`);
-          shouldStop = true;
-          break;
-        }
-
-        if (!saved) {
-          let postDate = toDateStr(new Date().toISOString());
-          let dateExtracted = false;
-          try {
-            const art = link.locator("xpath=ancestor::div[@role='article']").first();
-            const utime = await art.locator("abbr[data-utime]").first().getAttribute("data-utime");
-            const dt = await art.locator("time").first().getAttribute("datetime");
-            if (utime) { postDate = toDateStr(new Date(parseInt(utime) * 1000).toISOString()); dateExtracted = true; }
-            else if (dt) { postDate = toDateStr(dt); dateExtracted = true; }
-          } catch { /* ignore */ }
-
-          if (dateExtracted && !isWithinDays(postDate, DAYS_BACK)) {
-            logger.info(`    ⏭️ Too old (${postDate}), stopping`);
-            shouldStop = true; break;
+        // Generate unique ID from article content
+        const articleData = await article.evaluate((el: Element) => {
+          // Get all text for hashing
+          const text = el.textContent?.trim().slice(0, 200) || "";
+          // Find any post link
+          let postUrl = "";
+          const links = Array.from(el.querySelectorAll('a[href]'));
+          for (const a of links) {
+            const h = (a as HTMLAnchorElement).getAttribute("href") || "";
+            if (h.includes("/posts/") || h.includes("pfbid") || h.includes("story_fbid") ||
+                h.includes("permalink") || h.includes("/photo/") || h.includes("/reel/") || h.includes("/videos/")) {
+              postUrl = h; break;
+            }
           }
+          // Fallback: timestamp link
+          if (!postUrl) {
+            const timeLink = el.querySelector('a[role="link"] time, a time');
+            if (timeLink) {
+              const parent = timeLink.closest('a') as HTMLAnchorElement;
+              if (parent?.href) postUrl = parent.href;
+            }
+          }
+          // Get date
+          let date = "";
+          const timeEl = el.querySelector("time");
+          if (timeEl) date = timeEl.getAttribute("datetime") || "";
+          const abbrEl = el.querySelector("abbr[data-utime]");
+          if (abbrEl) {
+            const ut = abbrEl.getAttribute("data-utime");
+            if (ut) date = new Date(parseInt(ut) * 1000).toISOString();
+          }
+          // Caption: largest text block
+          let caption = "";
+          const divs = Array.from(el.querySelectorAll('div[dir="auto"], span[dir="auto"]'));
+          for (const d of divs) {
+            const t = d.textContent?.trim() || "";
+            if (t.length > caption.length && t.length > 10) caption = t;
+          }
+          return { text: text.slice(0, 100), postUrl, date, caption };
+        });
 
-          collected.push({ id: postId, url: fullUrl, postDate });
-          logger.info(`    📌 [${collected.length}] Found: ${postId}`);
-          if (collected.length >= limit) { shouldStop = true; break; }
+        // Generate post ID
+        let postId = "";
+        if (articleData.postUrl) {
+          const match = articleData.postUrl.match(/(?:posts\/|pfbid|story_fbid=|permalink\/|photo\/|reel\/|videos\/)([\w]+)/);
+          if (match) postId = match[1];
         }
-      } catch { /* skip */ }
+        if (!postId) {
+          // Hash from text content
+          let hash = 0;
+          for (let i = 0; i < articleData.text.length; i++) { hash = ((hash << 5) - hash + articleData.text.charCodeAt(i)) | 0; }
+          postId = `post_${Math.abs(hash).toString(36)}`;
+        }
+
+        const fullId = `${username}_${postId}`;
+        if (seenIds.has(fullId)) continue;
+        seenIds.add(fullId);
+
+        // Skip non-post articles (page info, details etc)
+        if (!articleData.caption || articleData.caption.length < 10) continue;
+
+        if (isSaved(progress, username, fullId)) continue;
+
+        // Date check
+        const postDate = articleData.date ? toDateStr(articleData.date) : toDateStr(new Date().toISOString());
+        if (articleData.date && !isWithinDays(articleData.date, DAYS_BACK)) {
+          logger.info(`  ⏭️ Too old (${postDate}), stopping`);
+          tooOldCount++;
+          continue;
+        }
+
+        // Take screenshot of the article element directly
+        const ssFile = screenshotPath(folder, postDate, sanitize(fullId));
+        let ssOk = false;
+        try {
+          fs.mkdirSync(path.dirname(ssFile), { recursive: true });
+          await article.scrollIntoViewIfNeeded();
+          await page.waitForTimeout(1000);
+          await article.screenshot({ path: ssFile });
+          ssOk = fs.existsSync(ssFile) && fs.statSync(ssFile).size > 5000;
+        } catch { /* ignore */ }
+
+        if (!ssOk) {
+          logger.warn(`  ⚠️ Screenshot failed for ${fullId}`);
+          continue;
+        }
+
+        const postUrl = articleData.postUrl
+          ? (articleData.postUrl.startsWith("http") ? articleData.postUrl : `https://www.facebook.com${articleData.postUrl}`)
+          : pageUrl;
+
+        const post: Post = {
+          id: fullId,
+          platform: "facebook",
+          source: pageName,
+          caption: articleData.caption,
+          url: postUrl,
+          postDate,
+          createdTime: new Date().toISOString(),
+        };
+
+        saveCaptionFile(folder, post, sanitize(fullId));
+        markSaved(progress, username, fullId);
+        saveProgress(progress);
+        posts.push(post);
+        logger.info(`  ✓ [${posts.length}] ${articleData.caption.slice(0, 60)} | screenshot ✓`);
+      } catch { /* skip article */ }
     }
 
-    if (shouldStop) break;
+    // Scroll down to load more
     try {
       await page.evaluate(() => window.scrollBy(0, 2000));
       await page.waitForTimeout(3000);
-      const h = await page.evaluate(() => document.body.scrollHeight);
-      if (h === lastHeight) { noNewCount++; if (noNewCount >= 4) break; } else { noNewCount = 0; lastHeight = h; }
     } catch { break; }
   }
 
-  logger.info(`  ✅ Scan সম্পন্ন — ${collected.length}টি new post`);
-  return collected;
-}
-
-async function getFullCaption(page: any): Promise<string> {
-  try {
-    for (const sel of ['div[role="button"]:has-text("See more")', 'div[role="button"]:has-text("আরও দেখুন")', 'span:has-text("See more")']) {
-      try { const b = page.locator(sel).first(); if (await b.isVisible({ timeout: 800 })) { await b.click(); await page.waitForTimeout(600); break; } } catch { /* ignore */ }
-    }
-
-    let best = "";
-    for (const sel of ['[data-ad-comet-preview="message"]', '[data-ad-preview="message"]', 'div[dir="auto"]']) {
-      try {
-        const els = await page.locator(sel).all();
-        for (const el of els) {
-          const txt = ((await el.textContent({ timeout: 800 })) ?? "").trim();
-          if (txt.length > best.length) best = txt;
-        }
-      } catch { /* ignore */ }
-    }
-    return best;
-  } catch { return ""; }
-}
-
-async function expandComments(page: any): Promise<void> {
-  logger.info("  💬 Expanding all comments...");
-  let totalExpanded = 0;
-
-  for (let attempt = 0; attempt < 15; attempt++) {
-    let expandedAny = false;
-
-    for (const sel of [
-      'span:has-text("View more comments")',
-      'span:has-text("View previous comments")',
-      'span:has-text("See more replies")',
-      'span:has-text("আরও মন্তব্য দেখুন")',
-      'span:has-text("পূর্ববর্তী মন্তব্য দেখুন")',
-      'div[role="button"]:has-text("View more comments")',
-      'div[role="button"]:has-text("View previous comments")',
-      'div[role="button"]:has-text("See more replies")',
-      'div[role="button"]:has-text("আরও মন্তব্য দেখুন")',
-      'span:has-text("View all")',
-      'span:has-text("View")',
-    ]) {
-      try {
-        const btns = await page.locator(sel).all();
-        for (const btn of btns) {
-          if (await btn.isVisible({ timeout: 500 })) {
-            await btn.click();
-            await page.waitForTimeout(1500);
-            expandedAny = true;
-            totalExpanded++;
-          }
-        }
-      } catch { /* ignore */ }
-    }
-
-    // Also scroll down inside the page to trigger lazy load
-    await page.evaluate(() => window.scrollBy(0, 1000));
-    await page.waitForTimeout(1000);
-
-    if (!expandedAny) break;
-  }
-  logger.info(`  💬 Comments expanded: ${totalExpanded} clicks`);
-}
-
-async function getComments(page: any): Promise<Comment[]> {
-  logger.info("  💬 Extracting comments...");
-  try {
-    const comments: Comment[] = await page.evaluate(() => {
-      const results: { author: string; text: string; url: string }[] = [];
-      const seen = new Set<string>();
-
-      // Strategy 1: Find comment containers by role="article" inside the comments section
-      const articles = Array.from(document.querySelectorAll('div[role="article"]'));
-
-      for (const article of articles) {
-        // Skip the main post article (usually the first one or has specific structure)
-        const isMainPost = article.querySelector('div[data-ad-comet-preview="message"]') ||
-          article.querySelector('div[data-ad-preview="message"]');
-        if (isMainPost) continue;
-
-        // Author: first link with user profile
-        let author = "Unknown";
-        const profileLinks = Array.from(article.querySelectorAll('a[href]')) as HTMLAnchorElement[];
-        for (const pl of profileLinks) {
-          const href = pl.href;
-          if (href.includes("/comment") || href.includes("story_fbid") || href.includes("/posts/")) continue;
-          if (href.includes("facebook.com/") && !href.includes("/groups/")) {
-            const txt = pl.textContent?.trim();
-            if (txt && txt.length > 0 && txt.length < 80) { author = txt; break; }
-          }
-        }
-
-        // Comment text: dir="auto" spans, skip author name and action words
-        let commentText = "";
-        const textEls = Array.from(article.querySelectorAll('span[dir="auto"], div[dir="auto"]'));
-        for (const el of textEls) {
-          const txt = el.textContent?.trim() || "";
-          if (!txt || txt === author) continue;
-          if (["Like", "Reply", "Share", "Translate", "Write a reply...", "See translation", "Most relevant"].includes(txt)) continue;
-          if (txt.match(/^\d+[wdhms]$/) || txt.match(/^\d+\s*(?:wk|day|hr|min|sec|week|month|year)s?\b/i)) continue;
-          if (txt.length > commentText.length) commentText = txt;
-        }
-
-        if (!commentText) continue;
-
-        // Comment URL: look for time links or any link with comment-related href
-        let commentUrl = "";
-        for (const pl of profileLinks) {
-          if (pl.href.includes("comment_id=") || pl.href.includes("/comment/")) {
-            commentUrl = pl.href;
-            break;
-          }
-        }
-        // Fallback: use aria-label time link
-        if (!commentUrl) {
-          const timeLink = article.querySelector('a[href*="comment_id="], a[role="link"] time');
-          if (timeLink) {
-            const parent = timeLink.closest('a');
-            if (parent) commentUrl = (parent as HTMLAnchorElement).href;
-          }
-        }
-
-        const key = `${author}:${commentText.slice(0, 50)}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-
-        results.push({
-          author,
-          text: commentText,
-          url: commentUrl || window.location.href
-        });
-      }
-
-      // Strategy 2: If no results from articles, try ul/li comment structure
-      if (results.length === 0) {
-        const commentItems = Array.from(document.querySelectorAll('ul > li'));
-        for (const li of commentItems) {
-          const spans = Array.from(li.querySelectorAll('span[dir="auto"]'));
-          if (spans.length < 2) continue;
-
-          let author = "Unknown";
-          let text = "";
-          for (const span of spans) {
-            const t = span.textContent?.trim() || "";
-            if (!t) continue;
-            if (["Like", "Reply", "Share", "Translate"].includes(t)) continue;
-            if (t.match(/^\d+[wdhms]$/)) continue;
-            if (author === "Unknown" && t.length < 50) { author = t; continue; }
-            if (t.length > text.length) text = t;
-          }
-
-          if (text) {
-            const key = `${author}:${text.slice(0, 50)}`;
-            if (!seen.has(key)) {
-              seen.add(key);
-              results.push({ author, text, url: window.location.href });
-            }
-          }
-        }
-      }
-
-      return results;
-    });
-
-    logger.info(`  💬 Found ${comments.length} comments`);
-    return comments;
-  } catch (err) {
-    logger.error("Comment extraction error: " + err);
-    return [];
-  }
+  logger.info(`  ✅ ${pageName}: ${posts.length}টি post`);
+  return posts;
 }
 
 async function run() {
@@ -359,8 +247,7 @@ async function run() {
     await page.waitForTimeout(3000);
     const cookies = await context.cookies();
     const hasUser = cookies.some((c: any) => c.name === "c_user");
-    const hasLogin = await page.locator("#email").first().isVisible({ timeout: 2000 }).catch(() => false);
-    loggedIn = hasUser && !hasLogin && !page.url().includes("login");
+    loggedIn = hasUser && !page.url().includes("login");
     if (loggedIn) logger.info("✅ Existing session কাজ করছে");
   } catch { loggedIn = false; }
 
@@ -373,72 +260,17 @@ async function run() {
 
   if (!loggedIn) { logger.error("❌ Login হয়নি"); await browser.close(); return; }
 
-  const allPosts: Post[] = [];
-
+  let total = 0;
   for (const pageInput of PAGES) {
     const username = pageInput.replace(/https?:\/\/(www\.)?facebook\.com\//i, "").replace(/\/$/, "").trim();
-    const pageUrl = `https://www.facebook.com/${username}`;
-    logger.info(`\n🔵 Facebook page: ${username}`);
-
     try {
-      try {
-        await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      } catch {
-        // Facebook often aborts initial navigation with redirects, try again with load
-        await page.goto(pageUrl, { waitUntil: "load", timeout: 30000 });
-      }
-      await page.waitForTimeout(4000);
-      let pageName = username;
-      try { const h1 = await page.locator("h1").first().textContent({ timeout: 3000 }); if (h1) pageName = h1.trim(); } catch { /* ignore */ }
-
-      const infos = await collectPostUrls(page, pageUrl, username, progress);
-      if (infos.length === 0) { logger.info("  ℹ️  কোনো নতুন post নেই"); continue; }
-
-      logger.info(`  📸 ${infos.length}টি post processing শুরু...`);
-
-      for (let i = 0; i < infos.length; i++) {
-        const info = infos[i];
-        logger.info(`  [${i + 1}/${infos.length}] Opening: ${info.url}`);
-        try {
-          try {
-            await page.goto(info.url, { waitUntil: "domcontentloaded", timeout: 30000 });
-          } catch {
-            await page.goto(info.url, { waitUntil: "load", timeout: 30000 });
-          }
-          await page.waitForTimeout(4000);
-
-          const caption = await getFullCaption(page);
-
-          const folder = makeFolder(OUTPUT_DIR, "facebook", sanitize(pageName));
-          const post: Post = {
-            id: info.id,
-            platform: "facebook",
-            source: pageName,
-            caption: caption || "(Caption নেই)",
-            url: info.url,
-            postDate: info.postDate,
-            createdTime: new Date().toISOString(),
-          };
-
-          saveCaptionFile(folder, post, info.id);
-          const ssOk = await takeScreenshot(page, screenshotPath(folder, info.postDate, info.id), true);
-
-          if (ssOk) {
-            markSaved(progress, username, info.id);
-            saveProgress(progress);
-            allPosts.push(post);
-            logger.info(`    ✓ Done: ${caption.slice(0, 60) || info.id} | screenshot ✓`);
-          } else {
-            logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${info.id} — will retry next run`);
-          }
-        } catch (err) { logger.warn(`    ⚠️ Skip: ${info.id} — ${err}`); }
-      }
-      logger.info(`  ✅ ${pageName}: সম্পন্ন`);
+      const posts = await scrapePage(page, username, progress);
+      total += posts.length;
     } catch (err) { logger.error(`  ❌ Error [${username}]: ${err}`); }
   }
 
   await browser.close();
-  logger.info(`\n🎉 Facebook Agent সম্পন্ন! মোট ${allPosts.length}টি post`);
+  logger.info(`\n🎉 Facebook Agent সম্পন্ন! মোট ${total}টি post`);
 }
 
 logger.info("╔══════════════════════════════════════╗");
