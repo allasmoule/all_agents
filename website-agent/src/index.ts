@@ -112,7 +112,6 @@ async function scrapeWebsite(siteUrl: string, page: any, progress: Record<string
       const caption = desc && desc !== title ? `${title}\n\n${desc}` : title;
       const url = item.link ?? siteUrl;
 
-      let comments: Comment[] = [];
       let ssOk = false;
 
       if (url) {
@@ -120,12 +119,9 @@ async function scrapeWebsite(siteUrl: string, page: any, progress: Record<string
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
           await page.waitForTimeout(3000);
 
-          // Try to get comments from the article page
-          comments = await getPageComments(page, url);
-
           const folder = makeFolder(OUTPUT_DIR, "website", sanitize(siteName));
           const cleanPostId = sanitize(postId);
-          const post: Post = { id: postId, platform: "website", source: siteName, caption, url, postDate, createdTime: item.isoDate ?? new Date().toISOString(), comments };
+          const post: Post = { id: postId, platform: "website", source: siteName, caption, url, postDate, createdTime: item.isoDate ?? new Date().toISOString() };
 
           saveCaptionFile(folder, post, cleanPostId);
           ssOk = await takeScreenshot(page, screenshotPath(folder, postDate, cleanPostId));
@@ -135,7 +131,7 @@ async function scrapeWebsite(siteUrl: string, page: any, progress: Record<string
             saveProgress(progress);
             posts.push(post);
             postIndex++;
-            logger.info(`    ✓ [${postIndex - 1}] ${title.slice(0, 60)} | ${comments.length} comments | screenshot ✓`);
+            logger.info(`    ✓ [${postIndex - 1}] ${title.slice(0, 60)} | screenshot ✓`);
           } else {
             logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${title.slice(0, 40)}`);
           }
@@ -163,18 +159,14 @@ async function scrapeWebsite(siteUrl: string, page: any, progress: Record<string
       const caption = summary && summary !== title ? `${title}\n\n${summary}` : title;
       const postDate = toDateStr(new Date().toISOString());
 
-      let comments: Comment[] = [];
-
       if (url) {
         try {
           await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20000 });
           await page.waitForTimeout(3000);
 
-          comments = await getPageComments(page, url);
-
           const folder = makeFolder(OUTPUT_DIR, "website", sanitize(siteName));
           const cleanPostId = sanitize(url);
-          const post: Post = { id: url, platform: "website", source: siteName, caption, url, postDate, createdTime: new Date().toISOString(), comments };
+          const post: Post = { id: url, platform: "website", source: siteName, caption, url, postDate, createdTime: new Date().toISOString() };
 
           saveCaptionFile(folder, post, cleanPostId);
           const ssOk = await takeScreenshot(page, screenshotPath(folder, postDate, cleanPostId));
@@ -184,7 +176,7 @@ async function scrapeWebsite(siteUrl: string, page: any, progress: Record<string
             saveProgress(progress);
             posts.push(post);
             postIndex++;
-            logger.info(`    ✓ [${postIndex - 1}] ${title.slice(0, 60)} | ${comments.length} comments | screenshot ✓`);
+            logger.info(`    ✓ [${postIndex - 1}] ${title.slice(0, 60)} | screenshot ✓`);
           } else {
             logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${title.slice(0, 40)}`);
           }

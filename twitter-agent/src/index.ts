@@ -176,10 +176,8 @@ async function scrapeAccount(page: any, accountInput: string, progress: Record<s
       let postDate = toDateStr(new Date().toISOString());
       try { const dt = await page.locator("time").first().getAttribute("datetime"); if (dt) postDate = toDateStr(dt); } catch { /* ignore */ }
 
-      const comments = await getReplies(page, tweetUrl);
-
       const folder = makeFolder(OUTPUT_DIR, "twitter", sanitize(displayName));
-      const post: Post = { id: tweetId, platform: "twitter", source: displayName, caption: caption || "(No text)", url: tweetUrl, postDate, createdTime: new Date().toISOString(), comments };
+      const post: Post = { id: tweetId, platform: "twitter", source: displayName, caption: caption || "(No text)", url: tweetUrl, postDate, createdTime: new Date().toISOString() };
 
       saveCaptionFile(folder, post, tweetId);
       const ssOk = await takeScreenshot(page, screenshotPath(folder, postDate, tweetId));
@@ -189,7 +187,7 @@ async function scrapeAccount(page: any, accountInput: string, progress: Record<s
         saveProgress(progress);
         posts.push(post);
         postIndex++;
-        logger.info(`    ✓ [${postIndex - 1}] ${caption.slice(0, 50) || tweetId} | ${comments.length} replies | screenshot ✓`);
+        logger.info(`    ✓ [${postIndex - 1}] ${caption.slice(0, 50) || tweetId} | screenshot ✓`);
       } else {
         logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${tweetId}`);
       }

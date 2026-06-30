@@ -49,26 +49,13 @@ export function saveCaptionFile(folder: string, post: Post, postId: string): str
     `PLATFORM  : ${post.platform}`,
     `PAGE      : ${post.source}`,
     `DATE      : ${post.postDate}`,
-    `URL       : ${post.url}`,
+    `POST LINK : ${post.url}`,
     `SAVED AT  : ${new Date().toISOString()}`,
     "─".repeat(60),
     "",
     post.caption,
     "",
   ];
-
-  if (post.comments && post.comments.length > 0) {
-    lines.push("─".repeat(60));
-    lines.push(`COMMENTS (${post.comments.length}):`);
-    lines.push("─".repeat(60));
-    post.comments.forEach((c, idx) => {
-      lines.push(`[Comment #${idx + 1}]`);
-      lines.push(`Author: ${c.author}`);
-      lines.push(`Link  : ${c.url}`);
-      lines.push(`Text  : ${c.text}`);
-      lines.push("");
-    });
-  }
 
   fs.writeFileSync(filepath, lines.join("\n"), "utf8");
   return filepath;

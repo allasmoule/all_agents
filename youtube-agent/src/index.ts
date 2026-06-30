@@ -136,16 +136,13 @@ async function scrapeWithApi(channelInput: string, page: any, progress: Record<s
       const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
       const caption = `${sn.title ?? ""}\n\n${(sn.description ?? "").slice(0, 500)}`;
 
-      let comments: Comment[] = [];
       try {
         await page.goto(videoUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
         await page.waitForTimeout(4000);
-        await expandComments(page);
-        comments = await getComments(page, videoUrl);
       } catch { /* ignore */ }
 
       const folder = makeFolder(OUTPUT_DIR, "youtube", sanitize(channelName));
-      const post: Post = { id: videoId, platform: "youtube", source: channelName, caption, url: videoUrl, postDate, createdTime: sn.publishedAt ?? new Date().toISOString(), comments };
+      const post: Post = { id: videoId, platform: "youtube", source: channelName, caption, url: videoUrl, postDate, createdTime: sn.publishedAt ?? new Date().toISOString() };
 
       saveCaptionFile(folder, post, videoId);
       const ssOk = await takeScreenshot(page, screenshotPath(folder, postDate, videoId));
@@ -155,7 +152,7 @@ async function scrapeWithApi(channelInput: string, page: any, progress: Record<s
         saveProgress(progress);
         posts.push(post);
         postIndex++;
-        logger.info(`    ✓ [${postIndex - 1}] ${sn.title?.slice(0, 60)} | ${comments.length} comments | screenshot ✓`);
+        logger.info(`    ✓ [${postIndex - 1}] ${sn.title?.slice(0, 60)} | screenshot ✓`);
       } else {
         logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${videoId}`);
       }
@@ -221,12 +218,9 @@ async function scrapeWithBrowser(channelInput: string, page: any, progress: Reco
       let title = "";
       try { title = (await page.locator("h1.ytd-watch-metadata yt-formatted-string").first().textContent({ timeout: 3000 })) ?? ""; title = title.trim(); } catch { /* ignore */ }
 
-      await expandComments(page);
-      const comments = await getComments(page, videoUrl);
-
       const postDate = toDateStr(new Date().toISOString());
       const folder = makeFolder(OUTPUT_DIR, "youtube", sanitize(channelName));
-      const post: Post = { id: videoId, platform: "youtube", source: channelName, caption: title || videoId, url: videoUrl, postDate, createdTime: new Date().toISOString(), comments };
+      const post: Post = { id: videoId, platform: "youtube", source: channelName, caption: title || videoId, url: videoUrl, postDate, createdTime: new Date().toISOString() };
 
       saveCaptionFile(folder, post, videoId);
       const ssOk = await takeScreenshot(page, screenshotPath(folder, postDate, videoId));
@@ -236,7 +230,7 @@ async function scrapeWithBrowser(channelInput: string, page: any, progress: Reco
         saveProgress(progress);
         posts.push(post);
         postIndex++;
-        logger.info(`    ✓ [${postIndex - 1}] ${title.slice(0, 60)} | ${comments.length} comments | screenshot ✓`);
+        logger.info(`    ✓ [${postIndex - 1}] ${title.slice(0, 60)} | screenshot ✓`);
       } else {
         logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${videoId}`);
       }

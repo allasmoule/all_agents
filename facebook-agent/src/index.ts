@@ -84,8 +84,8 @@ async function login(page: any, email: string, password: string): Promise<boolea
 }
 
 async function collectPostUrls(page: any, pageUrl: string, username: string, progress: Record<string, string[]>): Promise<{ id: string; url: string; postDate: string }[]> {
-  await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-  await page.waitForTimeout(4000);
+  // Page already navigated by caller, no need to goto again
+  await page.waitForTimeout(2000);
 
   const collected: { id: string; url: string; postDate: string }[] = [];
   const seenIds = new Set<string>();
@@ -94,7 +94,8 @@ async function collectPostUrls(page: any, pageUrl: string, username: string, pro
 
   const processedCount = progress[username] ? progress[username].length : 0;
   const isFirstRun = processedCount < 10;
-  const limit = isFirstRun ? (10 - processedCount) : (MAX_POSTS > 0 ? MAX_POSTS : 99999);
+  let limit = isFirstRun ? (10 - processedCount) : (MAX_POSTS > 0 ? MAX_POSTS : 99999);
+  if (MAX_POSTS > 0 && MAX_POSTS < limit) limit = MAX_POSTS;
 
   logger.info(`  🔍 Post URLs scan করছি: ${pageUrl}`);
 
@@ -141,10 +142,12 @@ async function collectPostUrls(page: any, pageUrl: string, username: string, pro
     }
 
     if (shouldStop) break;
-    await page.evaluate(() => window.scrollBy(0, 2000));
-    await page.waitForTimeout(3000);
-    const h = await page.evaluate(() => document.body.scrollHeight);
-    if (h === lastHeight) { noNewCount++; if (noNewCount >= 4) break; } else { noNewCount = 0; lastHeight = h; }
+    try {
+      await page.evaluate(() => window.scrollBy(0, 2000));
+      await page.waitForTimeout(3000);
+      const h = await page.evaluate(() => document.body.scrollHeight);
+      if (h === lastHeight) { noNewCount++; if (noNewCount >= 4) break; } else { noNewCount = 0; lastHeight = h; }
+    } catch { break; }
   }
 
   logger.info(`  ✅ Scan সম্পন্ন — ${collected.length}টি new post`);
@@ -371,8 +374,13 @@ async function run() {
     logger.info(`\n🔵 Facebook page: ${username}`);
 
     try {
-      await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
-      await page.waitForTimeout(2000);
+      try {
+        await page.goto(pageUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      } catch {
+        // Facebook often aborts initial navigation with redirects, try again with load
+        await page.goto(pageUrl, { waitUntil: "load", timeout: 30000 });
+      }
+      await page.waitForTimeout(4000);
       let pageName = username;
       try { const h1 = await page.locator("h1").first().textContent({ timeout: 3000 }); if (h1) pageName = h1.trim(); } catch { /* ignore */ }
 
@@ -385,12 +393,14 @@ async function run() {
         const info = infos[i];
         logger.info(`  [${i + 1}/${infos.length}] Opening: ${info.url}`);
         try {
-          await page.goto(info.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+          try {
+            await page.goto(info.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+          } catch {
+            await page.goto(info.url, { waitUntil: "load", timeout: 30000 });
+          }
           await page.waitForTimeout(4000);
 
-          await expandComments(page);
           const caption = await getFullCaption(page);
-          const comments = await getComments(page);
 
           const folder = makeFolder(OUTPUT_DIR, "facebook", sanitize(pageName));
           const post: Post = {
@@ -401,7 +411,6 @@ async function run() {
             url: info.url,
             postDate: info.postDate,
             createdTime: new Date().toISOString(),
-            comments
           };
 
           saveCaptionFile(folder, post, info.id);
@@ -411,7 +420,7 @@ async function run() {
             markSaved(progress, username, info.id);
             saveProgress(progress);
             allPosts.push(post);
-            logger.info(`    ✓ Done: ${caption.slice(0, 60) || info.id} | ${comments.length} comments | screenshot ✓`);
+            logger.info(`    ✓ Done: ${caption.slice(0, 60) || info.id} | screenshot ✓`);
           } else {
             logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${info.id} — will retry next run`);
           }

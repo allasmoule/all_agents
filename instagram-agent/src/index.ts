@@ -192,9 +192,6 @@ async function scrapeAccount(page: any, accountInput: string, progress: Record<s
       await page.goto(postUrl, { waitUntil: "domcontentloaded", timeout: 20000 });
       await page.waitForTimeout(3000);
 
-      // Expand comments
-      await expandComments(page);
-
       let caption = "";
       for (const sel of ['article h1', 'div._a9zs span', 'li:first-child span[dir]', 'div[data-testid="post-comment-root"] span']) {
         try { const txt = (await page.locator(sel).first().textContent({ timeout: 800 })) ?? ""; if (txt.trim().length > caption.length) caption = txt.trim(); } catch { /* ignore */ }
@@ -203,10 +200,8 @@ async function scrapeAccount(page: any, accountInput: string, progress: Record<s
       let postDate = toDateStr(new Date().toISOString());
       try { const dt = await page.locator("time").first().getAttribute("datetime"); if (dt) postDate = toDateStr(dt); } catch { /* ignore */ }
 
-      const comments = await getComments(page, postUrl);
-
       const folder = makeFolder(OUTPUT_DIR, "instagram", sanitize(profileName));
-      const post: Post = { id: postId, platform: "instagram", source: profileName, caption: caption || "(No caption)", url: postUrl, postDate, createdTime: new Date().toISOString(), comments };
+      const post: Post = { id: postId, platform: "instagram", source: profileName, caption: caption || "(No caption)", url: postUrl, postDate, createdTime: new Date().toISOString() };
 
       saveCaptionFile(folder, post, postId);
       const ssOk = await takeScreenshot(page, screenshotPath(folder, postDate, postId));
@@ -216,7 +211,7 @@ async function scrapeAccount(page: any, accountInput: string, progress: Record<s
         saveProgress(progress);
         posts.push(post);
         postIndex++;
-        logger.info(`    ✓ [${postIndex - 1}] ${caption.slice(0, 50) || postId} | ${comments.length} comments | screenshot ✓`);
+        logger.info(`    ✓ [${postIndex - 1}] ${caption.slice(0, 50) || postId} | screenshot ✓`);
       } else {
         logger.warn(`    ⚠️ Caption saved but screenshot FAILED for ${postId}`);
       }
