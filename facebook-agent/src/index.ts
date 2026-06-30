@@ -4,7 +4,7 @@ import * as path from "path";
 import * as dotenv from "dotenv";
 import * as cron from "node-cron";
 import { chromium } from "playwright";
-import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved } from "./helpers";
+import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved, isWithinDays } from "./helpers";
 import { takeScreenshot } from "./screenshot";
 import type { Post, Comment } from "./types";
 
@@ -16,6 +16,7 @@ const PASSWORD = process.env.FACEBOOK_PASSWORD ?? "";
 const PAGES = (process.env.FACEBOOK_PAGES ?? "").split(",").map(s => s.trim()).filter(Boolean);
 const HEADLESS = (process.env.HEADLESS ?? "false").toLowerCase() !== "false";
 const MAX_POSTS = parseInt(process.env.MAX_POSTS ?? "0") || 0;
+const DAYS_BACK = parseInt(process.env.DAYS_BACK ?? "7") || 7;
 const CRON = process.env.CRON_SCHEDULE ?? "0 8 * * *";
 
 const LOG_FILE = path.join(OUTPUT_DIR, "..", "logs", "facebook-agent.log");
@@ -126,13 +127,19 @@ async function collectPostUrls(page: any, pageUrl: string, username: string, pro
 
         if (!saved) {
           let postDate = toDateStr(new Date().toISOString());
+          let dateExtracted = false;
           try {
             const art = link.locator("xpath=ancestor::div[@role='article']").first();
             const utime = await art.locator("abbr[data-utime]").first().getAttribute("data-utime");
             const dt = await art.locator("time").first().getAttribute("datetime");
-            if (utime) postDate = toDateStr(new Date(parseInt(utime) * 1000).toISOString());
-            else if (dt) postDate = toDateStr(dt);
+            if (utime) { postDate = toDateStr(new Date(parseInt(utime) * 1000).toISOString()); dateExtracted = true; }
+            else if (dt) { postDate = toDateStr(dt); dateExtracted = true; }
           } catch { /* ignore */ }
+
+          if (dateExtracted && !isWithinDays(postDate, DAYS_BACK)) {
+            logger.info(`    ⏭️ Too old (${postDate}), stopping`);
+            shouldStop = true; break;
+          }
 
           collected.push({ id: postId, url: fullUrl, postDate });
           logger.info(`    📌 [${collected.length}] Found: ${postId}`);

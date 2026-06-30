@@ -5,7 +5,7 @@ import * as dotenv from "dotenv";
 import * as cron from "node-cron";
 import axios from "axios";
 import { chromium } from "playwright";
-import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved } from "./helpers";
+import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved, isWithinDays } from "./helpers";
 import { takeScreenshot } from "./screenshot";
 import type { Post, Comment } from "./types";
 
@@ -16,6 +16,7 @@ const API_KEY    = process.env.YOUTUBE_API_KEY ?? "";
 const CHANNELS   = (process.env.YOUTUBE_CHANNELS ?? "").split(",").map(s => s.trim()).filter(Boolean);
 const HEADLESS   = (process.env.HEADLESS ?? "false").toLowerCase() !== "false";
 const MAX_POSTS  = parseInt(process.env.MAX_POSTS ?? "0") || 0;
+const DAYS_BACK  = parseInt(process.env.DAYS_BACK ?? "7") || 7;
 const CRON       = process.env.CRON_SCHEDULE ?? "0 8 * * *";
 const YT         = "https://www.googleapis.com/youtube/v3";
 
@@ -133,6 +134,10 @@ async function scrapeWithApi(channelInput: string, page: any, progress: Record<s
       if (!videoId || isSaved(progress, channelName, videoId)) continue;
       const sn = item.snippet ?? {};
       const postDate = toDateStr(sn.publishedAt ?? "");
+      if (!isWithinDays(postDate, DAYS_BACK)) {
+        logger.info(`    ⏭️ Too old (${postDate}), stopping`);
+        break;
+      }
       const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
       const caption = `${sn.title ?? ""}\n\n${(sn.description ?? "").slice(0, 500)}`;
 
@@ -218,7 +223,16 @@ async function scrapeWithBrowser(channelInput: string, page: any, progress: Reco
       let title = "";
       try { title = (await page.locator("h1.ytd-watch-metadata yt-formatted-string").first().textContent({ timeout: 3000 })) ?? ""; title = title.trim(); } catch { /* ignore */ }
 
-      const postDate = toDateStr(new Date().toISOString());
+      let postDate = toDateStr(new Date().toISOString());
+      try {
+        const dateText = await page.locator('#info-strings yt-formatted-string, #upload-info span').first().textContent({ timeout: 2000 });
+        if (dateText) { const parsed = new Date(dateText.replace(/.*on\s+/i, "").trim()); if (!isNaN(parsed.getTime())) postDate = toDateStr(parsed.toISOString()); }
+      } catch { /* ignore */ }
+
+      if (!isWithinDays(postDate, DAYS_BACK)) {
+        logger.info(`    ⏭️ Too old (${postDate}), stopping`);
+        break;
+      }
       const folder = makeFolder(OUTPUT_DIR, "youtube", sanitize(channelName));
       const post: Post = { id: videoId, platform: "youtube", source: channelName, caption: title || videoId, url: videoUrl, postDate, createdTime: new Date().toISOString() };
 

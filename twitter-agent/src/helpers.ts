@@ -82,6 +82,15 @@ export function markSaved(p: Record<string, string[]>, key: string, id: string):
   if (!p[key].includes(id)) p[key].push(id);
 }
 
+export function isWithinDays(dateStr: string, days: number): boolean {
+  const postDate = new Date(dateStr);
+  if (isNaN(postDate.getTime())) return true;
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  cutoff.setHours(0, 0, 0, 0);
+  return postDate >= cutoff;
+}
+
 export function screenshotPath(folder: string, postDate: string, postId: string): string {
   return path.join(folder, `${postDate}_${postId}_screenshot.png`);
 }

@@ -7,7 +7,7 @@ import axios from "axios";
 import * as cheerio from "cheerio";
 import Parser from "rss-parser";
 import { chromium } from "playwright";
-import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved } from "./helpers";
+import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved, isWithinDays } from "./helpers";
 import { takeScreenshot } from "./screenshot";
 import type { Post, Comment } from "./types";
 
@@ -17,6 +17,7 @@ const OUTPUT_DIR = process.env.OUTPUT_DIR ?? "C:\\screenshots";
 const WEBSITES   = (process.env.WEBSITES ?? "").split(",").map(s => s.trim()).filter(Boolean);
 const HEADLESS   = (process.env.HEADLESS ?? "false").toLowerCase() !== "false";
 const MAX_POSTS  = parseInt(process.env.MAX_POSTS ?? "0") || 0;
+const DAYS_BACK  = parseInt(process.env.DAYS_BACK ?? "7") || 7;
 const CRON       = process.env.CRON_SCHEDULE ?? "0 8 * * *";
 const UA         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36";
 
@@ -107,6 +108,10 @@ async function scrapeWebsite(siteUrl: string, page: any, progress: Record<string
       if (!postId || isSaved(progress, siteName, postId)) continue;
 
       const postDate = toDateStr(item.pubDate ?? item.isoDate ?? "");
+      if (!isWithinDays(postDate, DAYS_BACK)) {
+        logger.info(`    ⏭️ Too old (${postDate}), stopping`);
+        break;
+      }
       const title = item.title ?? "";
       const desc = cheerio.load(item.contentSnippet ?? item.content ?? "").text().trim().slice(0, 400);
       const caption = desc && desc !== title ? `${title}\n\n${desc}` : title;

@@ -4,7 +4,7 @@ import * as path from "path";
 import * as dotenv from "dotenv";
 import * as cron from "node-cron";
 import { chromium } from "playwright";
-import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved } from "./helpers";
+import { getLogger, sanitize, toDateStr, makeFolder, saveCaptionFile, screenshotPath, loadProgress, saveProgress, isSaved, markSaved, isWithinDays } from "./helpers";
 import { takeScreenshot } from "./screenshot";
 import type { Post, Comment } from "./types";
 
@@ -17,6 +17,7 @@ const TWITTER_USERNAME = process.env.TWITTER_USERNAME ?? "";
 const ACCOUNTS         = (process.env.TWITTER_ACCOUNTS ?? "").split(",").map(s => s.trim()).filter(Boolean);
 const HEADLESS         = (process.env.HEADLESS ?? "false").toLowerCase() !== "false";
 const MAX_POSTS        = parseInt(process.env.MAX_POSTS ?? "0") || 0;
+const DAYS_BACK        = parseInt(process.env.DAYS_BACK ?? "7") || 7;
 const CRON             = process.env.CRON_SCHEDULE ?? "0 8 * * *";
 
 const LOG_FILE = path.join(OUTPUT_DIR, "..", "logs", "twitter-agent.log");
@@ -175,6 +176,11 @@ async function scrapeAccount(page: any, accountInput: string, progress: Record<s
 
       let postDate = toDateStr(new Date().toISOString());
       try { const dt = await page.locator("time").first().getAttribute("datetime"); if (dt) postDate = toDateStr(dt); } catch { /* ignore */ }
+
+      if (!isWithinDays(postDate, DAYS_BACK)) {
+        logger.info(`    ⏭️ Too old (${postDate}), stopping`);
+        break;
+      }
 
       const folder = makeFolder(OUTPUT_DIR, "twitter", sanitize(displayName));
       const post: Post = { id: tweetId, platform: "twitter", source: displayName, caption: caption || "(No text)", url: tweetUrl, postDate, createdTime: new Date().toISOString() };
